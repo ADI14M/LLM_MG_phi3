@@ -1,0 +1,12 @@
+# Data and Vector Store
+vector_db/
+faiss_db/
+*.pkl
+processed_data.pkl
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Environment Files
+.env
