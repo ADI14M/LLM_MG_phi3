@@ -276,6 +276,7 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
+
 st.title("🩺 Visukhi Medical Chatbot")
 
 if "chat_mode" not in st.session_state:
@@ -300,6 +301,40 @@ def get_all_patient_names():
     except Exception as e:
         return []
 
+def load_chat_history(mode, patient_id=None):
+    try:
+        import psycopg2
+        from config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
+        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
+        cur = conn.cursor()
+        
+        if mode == "Patient Mode" and patient_id is not None:
+            cur.execute("SELECT role, content FROM oads.chat_logs WHERE session_mode = %s AND patient_id = %s ORDER BY timestamp ASC", (mode, patient_id))
+        else:
+            # For Database mode or when no patient is selected
+            cur.execute("SELECT role, content FROM oads.chat_logs WHERE session_mode = %s AND patient_id IS NULL ORDER BY timestamp ASC", (mode,))
+            
+        rows = cur.fetchall()
+        conn.close()
+        
+        return [{"role": row[0], "content": row[1]} for row in rows]
+    except Exception as e:
+        print(f"Error loading chat history: {e}")
+        return []
+
+def save_chat_message(mode, patient_id, role, content):
+    try:
+        import psycopg2
+        from config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
+        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
+        cur = conn.cursor()
+        
+        cur.execute("INSERT INTO oads.chat_logs (session_mode, patient_id, role, content) VALUES (%s, %s, %s, %s)", (mode, patient_id, role, content))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error saving chat message: {e}")
+
 with st.sidebar:
     st.header("🔍 Patient Search")
     
@@ -318,7 +353,7 @@ with st.sidebar:
         st.session_state["last_selected_patient"] = search_name
         if search_name:
             st.session_state["chat_mode"] = "Patient Mode"
-            st.session_state["messages"] = []  # Rule 5: Clear history to prevent contamination
+            # History will be loaded automatically further down
         else:
             st.session_state["selected_patient_id"] = None
             st.session_state["selected_patient_name"] = None
@@ -448,7 +483,7 @@ Findings:
 
 
 # ====================== Settings ======================
-TEMPERATURE = 0.2
+TEMPERATURE = 0.0
 
 def get_llm(question):
     """Routes the question to the appropriate model based on clinical intent."""
@@ -479,14 +514,9 @@ def load_vectorstore():
         return None
 
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
 if "vectorstore" not in st.session_state:
     with st.spinner("Loading vector database..."):
         st.session_state.vectorstore = load_vectorstore()
-
-
 
 mode_index = 0 if st.session_state.get("chat_mode") == "Patient Mode" else 1
 new_mode = st.radio(
@@ -499,6 +529,20 @@ st.session_state["chat_mode"] = new_mode
 
 selected_patient_id = st.session_state.get("selected_patient_id")
 selected_patient_name = st.session_state.get("selected_patient_name")
+selected_patient_name = st.session_state.get("selected_patient_name")
+
+# Detect mode/patient changes and reload history
+current_mode = st.session_state["chat_mode"]
+last_loaded_mode = st.session_state.get("last_loaded_mode")
+last_loaded_patient = st.session_state.get("last_loaded_patient")
+
+if ("messages" not in st.session_state 
+    or last_loaded_mode != current_mode 
+    or last_loaded_patient != selected_patient_id):
+    
+    st.session_state.messages = load_chat_history(current_mode, selected_patient_id)
+    st.session_state["last_loaded_mode"] = current_mode
+    st.session_state["last_loaded_patient"] = selected_patient_id
 
 if st.session_state["chat_mode"] == "Patient Mode":
     if selected_patient_id:
@@ -522,6 +566,7 @@ if prompt := st.chat_input("Ask a medical question..."):
 
     # Show user message
     st.session_state.messages.append({"role": "user", "content": prompt})
+    save_chat_message(st.session_state["chat_mode"], st.session_state.get("selected_patient_id"), "user", prompt)
     with st.chat_message("user"):
         st.markdown(prompt)
 
@@ -873,7 +918,7 @@ if prompt := st.chat_input("Ask a medical question..."):
                 patient_context_block = "\n[ GLOBAL DATABASE MODE ]\nYou may search across all patients to answer the user's query.\n"
 
             prompt_template = ChatPromptTemplate.from_template("""
-You are a direct, robotic medical assistant.
+You are a direct, highly-precise clinical assistant.
 {patient_context_block}
 [ DATABASE STATISTICS ]
 Total Registered Patients: {total_patients}
@@ -883,12 +928,12 @@ Total EHR Lab Events: {total_labevents}
 [ PATIENT LAB EVENT CONTEXT ]
 {context}
 
-[ STRICT RULES ]
+[ STRICT RULES - NO HALLUCINATIONS ]
 1. Answer using ONLY natural language. NEVER output raw SQL queries or database code.
-2. Focus on clinical summarization, specifically pointing out any values flagged as ABNORMAL.
-3. Provide cohesive patient insights based on the retrieved lab events.
+2. Focus strictly on clinical summarization. DO NOT hallucinate, guess, or bluff. If you do not know, say you do not know.
+3. Provide cohesive patient insights based exactly on the provided Context. Do NOT repeat the same sentences multiple times.
 4. Output ONLY the final analytical answer. DO NOT explain your reasoning.
-5. If the answer cannot be confidently deduced from the Context or Database Statistics, output exactly: "Not found in database".
+5. If the exact answer cannot be confidently deduced from the Context, you MUST output exactly: "Not found in database". Do not attempt to guess or infer.
 
 Question: {question}
 
@@ -982,7 +1027,9 @@ Final Clinical Answer:
                 st.markdown("### ⚙️ LLM Prompt Instructions")
                 st.text_area("Final Prompt Generation Input", final_prompt, height=250)
 
+    final_assistant_content = final_cleaned_response if verified_patient_id is not None or not is_patient_query or lookup_status != "not_found" else "Patient not found."
     st.session_state.messages.append({
         "role": "assistant",
-        "content": final_cleaned_response if verified_patient_id is not None or not is_patient_query or lookup_status != "not_found" else "Patient not found."
+        "content": final_assistant_content
     })
+    save_chat_message(st.session_state["chat_mode"], st.session_state.get("selected_patient_id"), "assistant", final_assistant_content)
