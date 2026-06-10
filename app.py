@@ -301,39 +301,7 @@ def get_all_patient_names():
     except Exception as e:
         return []
 
-def load_chat_history(mode, patient_id=None):
-    try:
-        import psycopg2
-        from config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
-        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
-        cur = conn.cursor()
-        
-        if mode == "Patient Mode" and patient_id is not None:
-            cur.execute("SELECT role, content FROM oads.chat_logs WHERE session_mode = %s AND patient_id = %s ORDER BY timestamp ASC", (mode, patient_id))
-        else:
-            # For Database mode or when no patient is selected
-            cur.execute("SELECT role, content FROM oads.chat_logs WHERE session_mode = %s AND patient_id IS NULL ORDER BY timestamp ASC", (mode,))
-            
-        rows = cur.fetchall()
-        conn.close()
-        
-        return [{"role": row[0], "content": row[1]} for row in rows]
-    except Exception as e:
-        print(f"Error loading chat history: {e}")
-        return []
 
-def save_chat_message(mode, patient_id, role, content):
-    try:
-        import psycopg2
-        from config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
-        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
-        cur = conn.cursor()
-        
-        cur.execute("INSERT INTO oads.chat_logs (session_mode, patient_id, role, content) VALUES (%s, %s, %s, %s)", (mode, patient_id, role, content))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"Error saving chat message: {e}")
 
 with st.sidebar:
     st.header("🔍 Patient Search")
@@ -483,7 +451,7 @@ Findings:
 
 
 # ====================== Settings ======================
-TEMPERATURE = 0.0
+TEMPERATURE = 0.1
 
 def get_llm(question):
     """Routes the question to the appropriate model based on clinical intent."""
@@ -540,7 +508,7 @@ if ("messages" not in st.session_state
     or last_loaded_mode != current_mode 
     or last_loaded_patient != selected_patient_id):
     
-    st.session_state.messages = load_chat_history(current_mode, selected_patient_id)
+    st.session_state.messages = []
     st.session_state["last_loaded_mode"] = current_mode
     st.session_state["last_loaded_patient"] = selected_patient_id
 
@@ -566,7 +534,6 @@ if prompt := st.chat_input("Ask a medical question..."):
 
     # Show user message
     st.session_state.messages.append({"role": "user", "content": prompt})
-    save_chat_message(st.session_state["chat_mode"], st.session_state.get("selected_patient_id"), "user", prompt)
     with st.chat_message("user"):
         st.markdown(prompt)
 
@@ -844,12 +811,19 @@ if prompt := st.chat_input("Ask a medical question..."):
                 else:
                     context = "Not found in database"
             elif not (is_list_query and matched_modality):
-                # Standard path context formatting
                 context_parts = []
+                current_len = 0
                 for chunk in verified_chunks:
                     pid, study_date, image_type, findings, priority, confidence = chunk
                     confidence_str = f"Score: {confidence}" if confidence else ""
-                    context_parts.append(f"Patient ID: {pid}\nStudy Date: {study_date}\nImage Type: {image_type}\nFindings: {findings}\n{confidence_str}")
+                    chunk_str = f"Patient ID: {pid}\nStudy Date: {study_date}\nImage Type: {image_type}\nFindings: {findings}\n{confidence_str}"
+                    
+                    if current_len + len(chunk_str) > MAX_CONTEXT_CHARS:
+                        break
+                    
+                    context_parts.append(chunk_str)
+                    current_len += len(chunk_str)
+                    
                 context = "\n\n".join(context_parts)
                 
             # ====================== DB STATS ======================
@@ -954,7 +928,8 @@ Final Clinical Answer:
             llm = ChatOllama(
                 model=selected_model,
                 temperature=TEMPERATURE,
-                num_ctx=2048  # Hard cap memory allocation to stay under 2.5 GiB
+                num_ctx=4096,  # Increased to prevent generation cutoff
+                repeat_penalty=1.2 # Hard constraint against repetitive looping
             )
 
             stream = llm.stream(final_prompt)
@@ -1027,9 +1002,5 @@ Final Clinical Answer:
                 st.markdown("### ⚙️ LLM Prompt Instructions")
                 st.text_area("Final Prompt Generation Input", final_prompt, height=250)
 
-    final_assistant_content = final_cleaned_response if verified_patient_id is not None or not is_patient_query or lookup_status != "not_found" else "Patient not found."
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": final_assistant_content
-    })
-    save_chat_message(st.session_state["chat_mode"], st.session_state.get("selected_patient_id"), "assistant", final_assistant_content)
+    final_assistant_content = final_cleaned_response
+    st.session_state.messages.append({"role": "assistant", "content": final_assistant_content})
