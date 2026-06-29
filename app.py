@@ -18,8 +18,7 @@ def extract_and_verify_patient(prompt):
         detected_name (str or None): The exact name string that was resolved.
     """
     import re
-    import psycopg2
-    from config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
+    from database.patient_repository import PatientRepository
 
     query_lower = prompt.lower()
     
@@ -62,24 +61,16 @@ def extract_and_verify_patient(prompt):
     candidate_name = None
 
     try:
-        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
-        cur = conn.cursor()
-
         # A. Resolve using patient ID if explicitly specified
         if patient_id_num:
-            cur.execute("SELECT full_name FROM oads.patients WHERE patient_id = %s", (patient_id_num,))
-            row = cur.fetchone()
-            if row:
-                candidate_name = row[0]
+            candidate_name = PatientRepository.get_patient_name_by_id(patient_id_num)
 
         # B. If not resolved yet, resolve using name phrases dynamically (e.g. "Priya Reddy")
         if not candidate_name and len(candidate_words) >= 2:
             for i in range(len(candidate_words) - 1):
                 phrase = f"{candidate_words[i]} {candidate_words[i+1]}"
-                cur.execute("SELECT full_name FROM oads.patients WHERE full_name ILIKE %s ORDER BY patient_id LIMIT 1", (f"%{phrase}%",))
-                row = cur.fetchone()
-                if row:
-                    candidate_name = row[0]
+                candidate_name = PatientRepository.get_patient_name_by_phrase(phrase)
+                if candidate_name:
                     break
 
         # C. If not resolved yet, resolve using single names (e.g. "rahul")
@@ -87,29 +78,19 @@ def extract_and_verify_patient(prompt):
             for word in candidate_words:
                 if len(word) < 3:
                     continue
-                cur.execute("SELECT full_name FROM oads.patients WHERE full_name ILIKE %s ORDER BY patient_id LIMIT 1", (f"%{word}%",))
-                row = cur.fetchone()
-                if row:
-                    candidate_name = row[0]
+                candidate_name = PatientRepository.get_patient_name_by_phrase(word)
+                if candidate_name:
                     break
 
         if not candidate_name:
-            conn.close()
             # If a patient name was mentioned but could not be mapped to any record, return not_found
             return True, None, None, "not_found", " ".join(candidate_words) if candidate_words else f"Patient ID {patient_id_num}"
 
-        # D. Execute exact verification query:
-        # SELECT patient_id, full_name FROM oads.patients WHERE LOWER(full_name)=LOWER(%s)
-        cur.execute("""
-            SELECT patient_id, full_name
-            FROM oads.patients
-            WHERE LOWER(full_name) = LOWER(%s)
-        """, (candidate_name,))
-        row = cur.fetchone()
-        conn.close()
+        # D. Execute exact verification query
+        patient = PatientRepository.get_exact_patient(candidate_name)
 
-        if row:
-            return True, row[0], row[1], "verified", candidate_name
+        if patient:
+            return True, patient[0], patient[1], "verified", candidate_name
         else:
             return True, None, None, "not_found", candidate_name
 
@@ -217,9 +198,7 @@ st.set_page_config(
 
 
 
-import streamlit.components.v1 as components
-
-components.html(
+st.html(
     """
     <script>
     const doc = window.parent.document;
@@ -252,8 +231,7 @@ components.html(
         }
     }, 300);
     </script>
-    """,
-    height=0
+    """
 )
 
 st.markdown(
@@ -289,17 +267,8 @@ if "messages" not in st.session_state:
 # ====================== Patient Search Sidebar ======================
 @st.cache_data(ttl=3600)
 def get_all_patient_names():
-    try:
-        import psycopg2
-        from config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
-        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
-        cur = conn.cursor()
-        cur.execute("SELECT DISTINCT full_name FROM oads.patients ORDER BY full_name")
-        names = [row[0] for row in cur.fetchall() if row[0]]
-        conn.close()
-        return names
-    except Exception as e:
-        return []
+    from database.patient_repository import PatientRepository
+    return PatientRepository.get_all_patient_names()
 
 
 
@@ -332,46 +301,25 @@ with st.sidebar:
 
     if search_name:
         with st.spinner(f"Searching for {search_name}..."):
-            try:
-                import psycopg2
-                from config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
-                conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
-                cur = conn.cursor()
+            from database.patient_repository import PatientRepository
+            patient_info = PatientRepository.get_patient_info_by_name_search(search_name)
+            
+            if patient_info:
+                st.session_state["selected_patient_id"] = patient_info[0]
+                st.session_state["selected_patient_name"] = patient_info[1]
+                st.subheader(f"Patient: {patient_info[1]}")
+                st.write(f"**ID:** {patient_info[0]} | **Gender:** {patient_info[2].capitalize() if patient_info[2] else 'Unknown'}")
                 
-                # Fetch patient summary from OADS
-                query = """
-                SELECT p.patient_id, p.full_name, p.gender,
-                       s.study_date, s.priority,
-                       COALESCE(i.image_type, 'Unknown') AS image_type,
-                       COALESCE(a.findings_summary, 'No clinical findings recorded') AS findings_summary,
-                       a.confidence_score
-                FROM oads.patients p
-                LEFT JOIN oads.studies s ON p.patient_id = s.patient_id
-                LEFT JOIN oads.images i ON s.study_id = i.study_id
-                LEFT JOIN oads.analysis a ON i.image_id = a.image_id
-                WHERE p.full_name ILIKE %s
-                ORDER BY s.study_date DESC
-                LIMIT 10;
-                """
-                cur.execute(query, (f"%{search_name}%",))
-                rows = cur.fetchall()
-                conn.close()
-                
-                if rows:
-                    patient_info = rows[0]
-                    st.session_state["selected_patient_id"] = patient_info[0]
-                    st.session_state["selected_patient_name"] = patient_info[1]
-                    st.subheader(f"Patient: {patient_info[1]}")
-                    st.write(f"**ID:** {patient_info[0]} | **Gender:** {patient_info[2].capitalize() if patient_info[2] else 'Unknown'}")
-                    
-                    if patient_info[3]: # Has studies
-                        st.markdown("### Recent Studies & Findings")
-                        studies_text = ""
-                        for r in rows:
-                            if r[3]: # study_date
-                                conf_str = f"(Conf: {r[7]:.2f})" if r[7] is not None else ""
-                                findings = r[6] if r[6] else "No findings recorded"
-                                img_type = r[5].upper() if r[5] else "Unknown"
+                # Fetch recent studies summary for sidebar
+                records = PatientRepository.get_patient_clinical_records(patient_info[0])
+                if records:
+                    st.markdown("### Recent Studies & Findings")
+                    studies_text = ""
+                    for r in records[:10]: # Limit sidebar to 10
+                        if r[3]: # study_date
+                            conf_str = f"(Conf: {r[7]:.2f})" if r[7] is not None else ""
+                            findings = r[6] if r[6] else "No findings recorded"
+                            img_type = r[5].upper() if r[5] else "Unknown"
                                 date_str = r[3].strftime('%Y-%m-%d')
                                 st.markdown(f"""
 **Date:** {date_str}
@@ -471,20 +419,23 @@ FETCH_K = 40
 MAX_CONTEXT_CHARS = 3000
 
 
-@st.cache_resource
-def load_vectorstore():
+import os
+
+@st.cache_resource(show_spinner=False)
+def load_vectorstore(mod_time):
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
 
     try:
         return FAISS.load_local("./faiss_db", embeddings, allow_dangerous_deserialization=True)
     except Exception as e:
-        st.error(f"Failed to load FAISS DB. Run embed.py first. Error: {e}")
+        st.error(f"Failed to load FAISS DB. Error: {e}")
         return None
 
+faiss_path = "./faiss_db/index.faiss"
+mod_time = os.path.getmtime(faiss_path) if os.path.exists(faiss_path) else 0
 
-if "vectorstore" not in st.session_state:
-    with st.spinner("Loading vector database..."):
-        st.session_state.vectorstore = load_vectorstore()
+with st.spinner("Loading vector database..."):
+    st.session_state.vectorstore = load_vectorstore(mod_time)
 
 mode_index = 0 if st.session_state.get("chat_mode") == "Patient Mode" else 1
 new_mode = st.radio(
@@ -532,10 +483,38 @@ if prompt := st.chat_input("Ask a medical question..."):
         st.warning("⚠️ Cannot handle this query.")
         st.stop()
 
-    # Show user message
+    # Show original user message first so the UI feels responsive
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
+
+    # ====================== AUTOCORRECT TYPOS ======================
+    original_prompt = prompt
+    with st.spinner("Checking for typos..."):
+        try:
+            from langchain_ollama import ChatOllama
+            from langchain_core.prompts import ChatPromptTemplate
+            
+            correction_llm = ChatOllama(model="phi3", temperature=0.0)
+            correction_prompt = ChatPromptTemplate.from_template(
+                "You are an advanced medical spelling correction system. Your ONLY job is to fix typos and grammatical errors in the following user question. "
+                "You must preserve all medical terminology. If there are no typos, output the exact original text. "
+                "DO NOT answer the question. DO NOT add conversational filler. "
+                "ONLY output the corrected question.\n\nUser Question: {question}"
+            )
+            corrected_prompt = correction_llm.invoke(correction_prompt.format(question=prompt)).content.strip()
+            
+            # Clean up potential quotes added by the LLM
+            if corrected_prompt.startswith('"') and corrected_prompt.endswith('"'):
+                corrected_prompt = corrected_prompt[1:-1]
+                
+            # Validation: Ensure it didn't hallucinate a massive response
+            if corrected_prompt and len(corrected_prompt) < len(prompt) * 2.5:
+                if corrected_prompt.lower() != prompt.lower():
+                    st.info(f"💡 *Auto-corrected:* {corrected_prompt}")
+                    prompt = corrected_prompt
+        except Exception as e:
+            print(f"Autocorrect error: {e}")
 
     # Assistant
     with st.chat_message("assistant"):
@@ -595,89 +574,51 @@ if prompt := st.chat_input("Ask a medical question..."):
             # If a patient is found, restrict all retrieval to that patient_id (SQL first, FAISS second)
             if verified_patient_id is not None:
                 # 1. SQL Filtering First
-                sql_query = """
-                    SELECT
-                        p.patient_id, p.full_name, p.gender,
-                        s.study_date, s.priority,
-                        COALESCE(i.image_type, 'Unknown') AS image_type,
-                        COALESCE(a.findings_summary, 'No clinical findings recorded') AS findings_summary,
-                        a.confidence_score
-                    FROM oads.patients p
-                    JOIN oads.studies s ON p.patient_id = s.patient_id
-                    JOIN oads.images i ON s.study_id = i.study_id
-                    LEFT JOIN oads.analysis a ON i.image_id = a.image_id
-                    WHERE p.patient_id = %s
-                    ORDER BY s.study_date DESC
-                """
-                debug_sql_query = sql_query.strip()
+                patient_gender = PatientRepository.get_patient_gender(verified_patient_id)
+                sql_rows = PatientRepository.get_patient_clinical_records(verified_patient_id)
 
-                patient_gender = "Unknown"
-                try:
-                    import psycopg2
-                    from config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
-                    conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
-                    cur = conn.cursor()
-                    cur.execute(sql_query, (verified_patient_id,))
-                    sql_rows = cur.fetchall()
-                    conn.close()
+                debug_sql_records = len(sql_rows)
+                debug_sql_query = "SELECT ... FROM oads.patients ... WHERE patient_id = %s"
 
-                    debug_sql_records = len(sql_rows)
+                # ── STEP 4/5 guard: if no studies/images exist, report cleanly ──
+                if not sql_rows:
+                    full_response = f"No clinical records found for patient {verified_patient_name} (ID: {verified_patient_id})."
+                    placeholder.markdown(full_response)
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                    st.stop()
 
-                    if sql_rows:
-                        patient_gender = sql_rows[0][2] or "Unknown"
-                    else:
-                        # Fetch gender if no studies exist
-                        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
-                        cur = conn.cursor()
-                        cur.execute("SELECT gender FROM oads.patients WHERE patient_id = %s", (verified_patient_id,))
-                        row = cur.fetchone()
-                        conn.close()
-                        if row:
-                            patient_gender = row[0] or "Unknown"
+                # Check if ALL findings are the 'no findings' placeholder
+                real_findings = [r[6] for r in sql_rows if r[6] and r[6] != 'No clinical findings recorded']
+                if not real_findings:
+                    full_response = f"No clinical findings available for patient {verified_patient_name}."
+                    placeholder.markdown(full_response)
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                    st.stop()
 
-                    # ── STEP 4/5 guard: if no studies/images exist, report cleanly ──
-                    if not sql_rows:
-                        full_response = f"No clinical records found for patient {verified_patient_name} (ID: {verified_patient_id})."
-                        placeholder.markdown(full_response)
-                        st.session_state.messages.append({"role": "assistant", "content": full_response})
-                        st.stop()
+                # Format SQL rows as chunks
+                for r in sql_rows:
+                    pid, fname, gender, study_date, priority, img_type, findings, confidence = r
+                    if hasattr(study_date, "strftime"):
+                        study_date = study_date.strftime("%Y-%m-%d")
+                    confidence_str = f"{confidence:.2f}" if confidence is not None else "N/A"
+                    findings_str = findings if findings else "No clinical findings recorded"
 
-                    # Check if ALL findings are the 'no findings' placeholder (shouldn't happen
-                    # after the integrity fix, but guards against future partial runs)
-                    real_findings = [r[6] for r in sql_rows if r[6] and r[6] != 'No clinical findings recorded']
-                    if not real_findings:
-                        full_response = f"No clinical findings available for patient {verified_patient_name}."
-                        placeholder.markdown(full_response)
-                        st.session_state.messages.append({"role": "assistant", "content": full_response})
-                        st.stop()
-
-                    # Format SQL rows as chunks
-                    for r in sql_rows:
-                        pid, fname, gender, study_date, priority, img_type, findings, confidence = r
-                        if hasattr(study_date, "strftime"):
-                            study_date = study_date.strftime("%Y-%m-%d")
-                        confidence_str = f"{confidence:.2f}" if confidence is not None else "N/A"
-                        findings_str = findings if findings else "No clinical findings recorded"
-
-                        chunk_text = (
-                            f"Patient ID: {pid}\nPatient Name: {fname}\nGender: {gender}\n"
-                            f"Study Date: {study_date}\nStudy Priority: {priority}\n"
-                            f"Image Type: {img_type}\nFindings: {findings_str}\n"
-                            f"AI Confidence Score: {confidence_str}\n"
-                        )
-                        meta = {
-                            "patient_id": pid,
-                            "study_date": study_date,
-                            "image_type": img_type,
-                            "findings": findings_str,
-                            "priority": priority,
-                            "confidence": confidence_str
-                        }
-                        combined_chunks.append((chunk_text, meta))
-                        retrieved_pids.add(pid)
-                except Exception as e:
-                    debug_sql_query = f"Error in SQL query: {e}"
-                    debug_sql_records = 0
+                    chunk_text = (
+                        f"Patient ID: {pid}\nPatient Name: {fname}\nGender: {gender}\n"
+                        f"Study Date: {study_date}\nStudy Priority: {priority}\n"
+                        f"Image Type: {img_type}\nFindings: {findings_str}\n"
+                        f"AI Confidence Score: {confidence_str}\n"
+                    )
+                    meta = {
+                        "patient_id": pid,
+                        "study_date": study_date,
+                        "image_type": img_type,
+                        "findings": findings_str,
+                        "priority": priority,
+                        "confidence": confidence_str
+                    }
+                    combined_chunks.append((chunk_text, meta))
+                    retrieved_pids.add(pid)
                     
                 # 2. FAISS Retrieval Second
                 try:
@@ -709,57 +650,34 @@ if prompt := st.chat_input("Ask a medical question..."):
                 
                 if is_list_query and matched_modality:
                     # Hybrid Path: Query database directly for all patients with this scan type
-                    sql_query = """
-                        SELECT p.patient_id, p.full_name, string_agg(DISTINCT i.image_type, ', ') as scan_types, string_agg(DISTINCT a.findings_summary, '; ') as findings
-                        FROM oads.patients p
-                        JOIN oads.studies s ON p.patient_id = s.patient_id
-                        JOIN oads.images i ON s.study_id = i.study_id
-                        LEFT JOIN oads.analysis a ON i.image_id = a.image_id
-                        WHERE i.image_type ILIKE %s
-                        GROUP BY p.patient_id, p.full_name
-                        ORDER BY p.patient_id;
-                    """
-                    debug_sql_query = sql_query.strip()
+                    rows = PatientRepository.get_patients_by_modality(matched_modality)
+                    debug_sql_query = "SELECT ... FROM oads.patients ... WHERE i.image_type ILIKE %s"
                     
-                    try:
-                        import psycopg2
-                        import math
-                        from config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
-                        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
-                        cur = conn.cursor()
-                        sql_modality = "xray" if matched_modality in ["xray", "x-ray"] else matched_modality
-                        cur.execute(sql_query, (sql_modality,))
-                        rows = cur.fetchall()
-                        conn.close()
+                    debug_sql_records = len(rows)
+                    debug_faiss_chunks = 0
+                    
+                    import math
+                    total_count = len(rows)
+                    page_size = 10
+                    total_pages = math.ceil(total_count / page_size) if total_count > 0 else 1
+                    page = 1  # Default to page 1
+                    
+                    context_parts = [
+                        f"Total Patients with {matched_modality.upper()} scans found in database: {total_count}.",
+                        f"Showing Page {page} of {total_pages}:"
+                    ]
+                    
+                    start_idx = (page - 1) * page_size
+                    end_idx = start_idx + page_size
+                    page_rows = rows[start_idx:end_idx]
+                    
+                    for idx, r in enumerate(page_rows):
+                        pid, name, scan_types, findings = r
+                        findings_str = findings if findings else "No findings recorded"
+                        context_parts.append(f"{start_idx + idx + 1}. Patient ID: {pid} | Name: {name} | Modalities: {scan_types.upper()} | Findings: {findings_str}")
+                        retrieved_pids.add(pid)
                         
-                        debug_sql_records = len(rows)
-                        debug_faiss_chunks = 0
-                        
-                        # Text-based pagination details
-                        total_count = len(rows)
-                        page_size = 10
-                        total_pages = math.ceil(total_count / page_size) if total_count > 0 else 1
-                        page = 1  # Default to page 1
-                        
-                        context_parts = [
-                            f"Total Patients with {matched_modality.upper()} scans found in database: {total_count}.",
-                            f"Showing Page {page} of {total_pages}:"
-                        ]
-                        
-                        start_idx = (page - 1) * page_size
-                        end_idx = start_idx + page_size
-                        page_rows = rows[start_idx:end_idx]
-                        
-                        for idx, r in enumerate(page_rows):
-                            pid, name, scan_types, findings = r
-                            findings_str = findings if findings else "No findings recorded"
-                            context_parts.append(f"{start_idx + idx + 1}. Patient ID: {pid} | Name: {name} | Modalities: {scan_types.upper()} | Findings: {findings_str}")
-                            retrieved_pids.add(pid)
-                            
-                        context = "\n".join(context_parts)
-                    except Exception as e:
-                        context = "Error retrieving matching patients from database."
-                        debug_sql_query = f"Error in SQL query: {e}"
+                    context = "\n".join(context_parts)
                 else:
                     # Standard Path: MMR Vector Search for general questions
                     search_kwargs = {"k": TOP_K, "fetch_k": FETCH_K, "lambda_mult": 0.5}
@@ -826,62 +744,6 @@ if prompt := st.chat_input("Ask a medical question..."):
                     
                 context = "\n\n".join(context_parts)
                 
-            # ====================== DB STATS ======================
-            if "db_stats" not in st.session_state:
-                try:
-                    import psycopg2
-                    from config import DB_HOST, DB_NAME, DB_USER, DB_PASSWORD, DB_PORT
-                    
-                    # Connect to ehr_db for live EHR counts
-                    conn_ehr = psycopg2.connect(host=DB_HOST, database='ehr_db', user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
-                    cur_ehr = conn_ehr.cursor()
-                    cur_ehr.execute("SELECT COUNT(*) FROM ehr.patients")
-                    total_patients = cur_ehr.fetchone()[0]
-                    cur_ehr.execute("SELECT COUNT(*) FROM ehr.labevents")
-                    total_labevents = cur_ehr.fetchone()[0]
-                    cur_ehr.close()
-                    conn_ehr.close()
-                    
-                    # Connect to oads_db for imaging mappings
-                    conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT)
-                    cur = conn.cursor()
-                    cur.execute("""
-                        SELECT DISTINCT p.patient_id, p.full_name, i.image_type
-                        FROM oads.patients p
-                        JOIN oads.studies s ON p.patient_id = s.patient_id
-                        JOIN oads.images i ON s.study_id = i.study_id
-                        ORDER BY p.patient_id
-                    """)
-                    rows = cur.fetchall()
-                    conn.close()
-                    
-                    patient_map = {}
-                    for pid, name, img_type in rows:
-                        if name not in patient_map:
-                            patient_map[name] = []
-                        if img_type:
-                            patient_map[name].append(img_type.upper())
-                    
-                    summary_lines = ["[ PATIENT IMAGING MAPPING ]"]
-                    for name, modalities in patient_map.items():
-                        summary_lines.append(f"- {name}: {', '.join(modalities)}")
-                    imaging_summary = "\n".join(summary_lines)
-                    
-                    st.session_state.db_stats = {
-                        "total_patients": total_patients,
-                        "total_labevents": total_labevents,
-                        "imaging_summary": imaging_summary
-                    }
-                except Exception as e:
-                    print(f"Error fetching DB statistics: {e}")
-                    st.session_state.db_stats = {
-                        "total_patients": "Unknown",
-                        "total_labevents": "Unknown",
-                        "imaging_summary": ""
-                    }
-
-            stats = st.session_state.db_stats
-
             # ====================== PROMPT ======================
             patient_context_block = ""
             if st.session_state.get("chat_mode") == "Patient Mode" and st.session_state.get("selected_patient_id"):
@@ -894,10 +756,6 @@ if prompt := st.chat_input("Ask a medical question..."):
             prompt_template = ChatPromptTemplate.from_template("""
 You are a direct, highly-precise clinical assistant.
 {patient_context_block}
-[ DATABASE STATISTICS ]
-Total Registered Patients: {total_patients}
-Total EHR Lab Events: {total_labevents}
-{imaging_summary}
 
 [ PATIENT LAB EVENT CONTEXT ]
 {context}
@@ -906,7 +764,7 @@ Total EHR Lab Events: {total_labevents}
 1. Answer using ONLY natural language. NEVER output raw SQL queries or database code.
 2. Focus strictly on clinical summarization. DO NOT hallucinate, guess, or bluff. If you do not know, say you do not know.
 3. Provide cohesive patient insights based exactly on the provided Context. Do NOT repeat the same sentences multiple times.
-4. Output ONLY the final analytical answer. DO NOT explain your reasoning.
+4. Output ONLY the final analytical answer. DO NOT explain your reasoning. YOU MUST NOT output any internal thoughts, <unused94>thought tags, or step-by-step reasoning lists. Jump immediately to the final answer.
 5. If the exact answer cannot be confidently deduced from the Context, you MUST output exactly: "Not found in database". Do not attempt to guess or infer.
 
 Question: {question}
@@ -916,38 +774,42 @@ Final Clinical Answer:
 
             final_prompt = prompt_template.format(
                 patient_context_block=patient_context_block,
-                total_patients=stats["total_patients"],
-                total_labevents=stats["total_labevents"],
-                imaging_summary=stats.get("imaging_summary", ""),
                 context=context,
                 question=prompt
             )
 
             # ====================== LLM ======================
             selected_model = get_llm(prompt)
-            llm = ChatOllama(
-                model=selected_model,
-                temperature=TEMPERATURE,
-                num_ctx=4096,  # Increased to prevent generation cutoff
-                repeat_penalty=1.2 # Hard constraint against repetitive looping
-            )
+            final_cleaned_response = ""
+            
+            try:
+                llm = ChatOllama(
+                    model=selected_model,
+                    temperature=TEMPERATURE,
+                    num_ctx=4096,  # Increased to prevent generation cutoff
+                    repeat_penalty=1.2 # Hard constraint against repetitive looping
+                )
 
-            stream = llm.stream(final_prompt)
+                stream = llm.stream(final_prompt)
 
-            for chunk in stream:
-                if hasattr(chunk, "content"):
-                    full_response += chunk.content
-                else:
-                    full_response += str(chunk)
+                for chunk in stream:
+                    if hasattr(chunk, "content"):
+                        full_response += chunk.content
+                    else:
+                        full_response += str(chunk)
 
-                display_response = clean_llm_output(full_response)
-                if display_response:
-                    placeholder.markdown(display_response + "▌")
-                else:
-                    placeholder.markdown("*Thinking...*")
+                    display_response = clean_llm_output(full_response)
+                    if display_response:
+                        placeholder.markdown(display_response + "▌")
+                    else:
+                        placeholder.markdown("*Thinking...*")
 
-            final_cleaned_response = clean_llm_output(full_response)
-            placeholder.markdown(final_cleaned_response)
+                final_cleaned_response = clean_llm_output(full_response)
+                placeholder.markdown(final_cleaned_response)
+            
+            except Exception as e:
+                final_cleaned_response = f"An error occurred while communicating with the AI model: {e}"
+                placeholder.markdown(final_cleaned_response)
 
             # ====================== TIME ======================
             end_time = time.time()

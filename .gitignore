@@ -10,3 +10,4 @@ __pycache__/
 
 # Environment Files
 .env
+sync_state.db
