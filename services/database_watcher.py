@@ -72,9 +72,9 @@ class DatabaseWatcher:
                 p.patient_id, p.full_name, p.gender, s.study_date, s.priority,
                 i.image_type, a.findings_summary, a.confidence_score
             FROM oads.patients p
-            JOIN oads.studies s ON p.patient_id = s.patient_id
-            JOIN oads.images i ON s.study_id = i.study_id
-            JOIN oads.analysis a ON i.image_id = a.image_id
+            LEFT JOIN oads.studies s ON p.patient_id = s.patient_id
+            LEFT JOIN oads.images i ON s.study_id = i.study_id
+            LEFT JOIN oads.analysis a ON i.image_id = a.image_id
             ORDER BY s.study_date DESC;
             """
             
@@ -98,8 +98,8 @@ class DatabaseWatcher:
             return new_records, deleted_hashes
 
         except Exception as e:
-            print(f"[Watcher] Error reading from PostgreSQL: {e}")
-            return [], []
+            # We raise the exception so builder_service.py can log it explicitly
+            raise e
         finally:
             if cursor: cursor.close()
             if conn: conn.close()
